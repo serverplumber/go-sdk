@@ -348,16 +348,43 @@ func TestStdioInFlightRepliesAtEOF(t *testing.T) {
 }
 
 // TestIOConnOversizedFrame sends a frame larger than the newIOConnLimited cap,
-// then a newline, then ping 3.
+// then ping 3. An oversized frame is a bad frame like any other: the transport
+// must discard the rest of it without buffering it, reset the cap, and deliver
+// ping 3.
 //
-// Undecided: whether an oversized frame stays fatal or is recovered from.
-//   - Fatal: Read returns an error wrapping errFrameTooLarge, and this test
-//     adds nothing beyond [TestIOConnFrameCap].
-//   - Recovered: the rest of the frame is discarded without being buffered, an
-//     error response is written, the cap is reset, and ping 3 is returned. The
-//     "cap does not reset per new line" case in [TestIOConnFrameCap] then needs
-//     rewriting, and an endless frame with no newline must still return within
-//     a timeout.
+// Whether Read reports errFrameTooLarge first is a design choice, so the test
+// accepts either. [TestIOConnFrameCap] checks that the cap trips at all,
+// including on an endless frame with no newline.
+//
+// Framing on lines changes one [TestIOConnFrameCap] case: "cap does not reset
+// per new line" assumes a value can span lines, which the stdio transport
+// forbids ("MUST NOT contain embedded newlines").
 func TestIOConnOversizedFrame(t *testing.T) {
-	t.Skip("blocked on deciding whether an oversized frame is recoverable")
+	const limit = 1024
+	tests := []struct {
+		name  string
+		frame string
+	}{
+		// A valid request, so a transport that buffered past the cap would
+		// deliver it.
+		{"request", `{"jsonrpc":"2.0","id":9,"method":"ping","params":{"pad":"` + strings.Repeat("A", 2*limit) + `"}}`},
+		{"garbage", strings.Repeat("A", 2*limit)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// ping 3 is far under the cap, so it is only delivered if the cap
+			// was reset after the oversized frame.
+			tr := newIOConnLimited(rwc{rc: io.NopCloser(strings.NewReader(tt.frame + "\n" + stdioPing3 + "\n"))}, limit)
+			t.Cleanup(func() { tr.Close() })
+
+			msgs := readUntilEOF(t, tr)
+			if len(msgs) != 1 {
+				t.Fatalf("read %d messages %v, want only ping 3", len(msgs), msgs)
+			}
+			req, ok := msgs[0].(*jsonrpc.Request)
+			if !ok || req.Method != methodPing || req.ID != jsonrpc2.Int64ID(3) {
+				t.Errorf("read %v, want ping 3", msgs[0])
+			}
+		})
+	}
 }
